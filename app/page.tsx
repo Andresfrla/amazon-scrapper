@@ -1,65 +1,246 @@
-import Image from "next/image";
+"use client";
+
+import { QueryStats } from "@mui/icons-material";
+import {
+  AppBar,
+  Box,
+  Container,
+  CssBaseline,
+  Stack,
+  ThemeProvider,
+  Toolbar,
+  Typography,
+  createTheme,
+} from "@mui/material";
+import { useMemo, useState } from "react";
+import { AsinInputCard } from "@/components/asins/AsinInputCard";
+import { ResultsTableCard } from "@/components/asins/ResultsTableCard";
+import { ScrapeStatusCard } from "@/components/asins/ScrapeStatusCard";
+import { parseRawAsins, splitValidAndInvalid } from "@/lib/asins";
+import { buildScrapeExcel } from "@/lib/excel";
+import type { ScrapeItem, ScrapeResponse } from "@/types/scrape";
+
+type UiStatus = "idle" | "loading" | "success" | "error";
+
+const theme = createTheme({
+  palette: {
+    mode: "light",
+    primary: { main: "#0b57d0" },
+    secondary: { main: "#0f766e" },
+    background: { default: "#f4f8ff", paper: "#ffffff" },
+  },
+  shape: { borderRadius: 14 },
+  typography: {
+    fontFamily: "var(--font-geist-sans), 'Segoe UI', sans-serif",
+    h4: { fontWeight: 800, letterSpacing: -0.4 },
+  },
+});
+
+const REQUEST_TIMEOUT_MS = 2 * 60 * 1000;
+
+function downloadExcelFile(filename: string, bytes: Uint8Array) {
+  const blob = new Blob([bytes], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.setAttribute("download", filename);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function buildMeta(items: ScrapeItem[], durationMs: number) {
+  const success = items.filter((item) => item.status === "ok").length;
+  const notFound = items.filter((item) => item.status === "not_found").length;
+  const failed = items.filter((item) => item.status === "error").length;
+
+  return {
+    total: items.length,
+    success,
+    failed,
+    notFound,
+    durationMs,
+  };
+}
+
+async function scrapeSingleAsin(asin: string): Promise<ScrapeItem> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const apiResponse = await fetch("/api/scrape", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ asins: [asin] }),
+      signal: controller.signal,
+    });
+
+    const json = (await apiResponse.json()) as ScrapeResponse | { error: string };
+    if (!apiResponse.ok || "error" in json) {
+      const error = "error" in json ? json.error : "Error inesperado.";
+      throw new Error(error);
+    }
+
+    if (!json.items[0]) {
+      throw new Error("El scraper no devolvio item para el ASIN.");
+    }
+
+    return json.items[0];
+  } catch (error) {
+    const message =
+      error instanceof DOMException && error.name === "AbortError"
+        ? "Timeout por ASIN (2 minutos)."
+        : error instanceof Error
+          ? error.message
+          : "No fue posible scrapear este ASIN.";
+
+    return {
+      asin,
+      status: "error",
+      error: message,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 export default function Home() {
+  const [rawInput, setRawInput] = useState("");
+  const [status, setStatus] = useState<UiStatus>("idle");
+  const [message, setMessage] = useState<string>("Listo para iniciar scraping.");
+  const [response, setResponse] = useState<ScrapeResponse | null>(null);
+  const [progressDone, setProgressDone] = useState(0);
+  const [progressTotal, setProgressTotal] = useState(0);
+
+  const parsedAsins = useMemo(() => parseRawAsins(rawInput), [rawInput]);
+  const { valid, invalid } = useMemo(() => splitValidAndInvalid(parsedAsins), [parsedAsins]);
+
+  const helperText = invalid.length
+    ? `ASINs invalidos (${invalid.length}). Ejemplo: ${invalid[0]}`
+    : `ASINs validos: ${valid.length}`;
+
+  const handleClear = () => {
+    setRawInput("");
+    setStatus("idle");
+    setMessage("Listo para iniciar scraping.");
+    setResponse(null);
+    setProgressDone(0);
+    setProgressTotal(0);
+  };
+
+  const handleSubmit = async () => {
+    if (valid.length === 0) {
+      setStatus("error");
+      setMessage("Captura al menos un ASIN valido de 10 caracteres.");
+      return;
+    }
+
+    if (invalid.length > 0) {
+      setStatus("error");
+      setMessage(`Corrige ASINs invalidos antes de continuar. Ejemplo: ${invalid[0]}`);
+      return;
+    }
+
+    if (valid.length > 100) {
+      setStatus("error");
+      setMessage("El maximo por ejecucion es 100 ASINs.");
+      return;
+    }
+
+    const startedAt = performance.now();
+    const collectedItems: ScrapeItem[] = [];
+
+    console.log("[ui] scraping:start", { totalAsins: valid.length });
+    setStatus("loading");
+    setMessage("Iniciando scraping...");
+    setResponse(null);
+    setProgressDone(0);
+    setProgressTotal(valid.length);
+
+    for (let index = 0; index < valid.length; index += 1) {
+      const asin = valid[index];
+      setMessage(`Scrapeando ${index + 1}/${valid.length}: ${asin}`);
+
+      const item = await scrapeSingleAsin(asin);
+      collectedItems.push(item);
+      setProgressDone(index + 1);
+    }
+
+    const durationMs = Math.round(performance.now() - startedAt);
+    const finalResponse: ScrapeResponse = {
+      meta: buildMeta(collectedItems, durationMs),
+      items: collectedItems,
+    };
+
+    console.log("[ui] scraping:done", finalResponse.meta);
+    setResponse(finalResponse);
+    setStatus("success");
+    setMessage(`Proceso completado. Scrapeados ${collectedItems.length}/${valid.length}.`);
+  };
+
+  const handleDownloadExcel = () => {
+    if (!response || response.items.length === 0) {
+      return;
+    }
+
+    const bytes = buildScrapeExcel(response.items);
+    const stamp = new Date().toISOString().replaceAll(":", "-");
+    downloadExcelFile(`resultado_final_${stamp}.xlsx`, bytes);
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <Box sx={{ minHeight: "100vh", background: "radial-gradient(circle at top, #dbeafe 0%, #f4f8ff 55%)" }}>
+        <AppBar
+          position="sticky"
+          color="transparent"
+          elevation={0}
+          sx={{ backdropFilter: "blur(8px)", borderBottom: "1px solid", borderColor: "divider" }}
+        >
+          <Toolbar>
+            <QueryStats sx={{ mr: 1 }} />
+            <Typography variant="h6" sx={{ fontWeight: 800 }}>
+              Amazon ASIN Scrapper
+            </Typography>
+          </Toolbar>
+        </AppBar>
+
+        <Container maxWidth="lg" sx={{ py: { xs: 3, md: 5 } }}>
+          <Stack spacing={2} sx={{ mb: 3 }}>
+            <Typography variant="h4">Scraping de ASINs en lote</Typography>
+            <Typography color="text.secondary">
+              Pega tus ASINs, corre el scraping y descarga el resultado final en Excel.
+            </Typography>
+          </Stack>
+
+          <Stack spacing={2.5}>
+            <AsinInputCard
+              rawInput={rawInput}
+              onInputChange={setRawInput}
+              onSubmit={handleSubmit}
+              onClear={handleClear}
+              loading={status === "loading"}
+              helperText={helperText}
+              count={valid.length}
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+
+            <ScrapeStatusCard
+              status={status}
+              meta={response?.meta ?? null}
+              message={message}
+              progressDone={progressDone}
+              progressTotal={progressTotal}
+            />
+
+            <ResultsTableCard items={response?.items ?? []} onDownloadExcel={handleDownloadExcel} />
+          </Stack>
+        </Container>
+      </Box>
+    </ThemeProvider>
   );
 }
