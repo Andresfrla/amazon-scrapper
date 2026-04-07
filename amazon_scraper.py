@@ -49,18 +49,15 @@ def normalize_text(value: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Common mojibake and replacement-char fixes seen in Amazon seller names
     replacements = {
-        "Amazon Jap n": "Amazon Jap\u00f3n",
-        "Amazon Jap\ufffdn": "Amazon Jap\u00f3n",
-        "Amazon Jap\u00c3\u00b3n": "Amazon Jap\u00f3n",
-        "Amazon M xico": "Amazon M\u00e9xico",
-        "Amazon M\ufffdxico": "Amazon M\u00e9xico",
-        "Amazon M\u00c3\u00a9xico": "Amazon M\u00e9xico",
-        "ENV\ufffdO": "ENV\u00cdO",
-        "D\ufffdA": "D\u00cdA",
-        "M\ufffdXICO": "M\u00c9XICO",
-        "M\ufffdxico": "M\u00e9xico",
+        "Amazon Jap n": "Amazon Japon",
+        "Amazon Jap\ufffdn": "Amazon Japon",
+        "Amazon Jap\u00c3\u00b3n": "Amazon Japon",
+        "Amazon M xico": "Amazon Mexico",
+        "Amazon M\ufffdxico": "Amazon Mexico",
+        "Amazon M\u00c3\u00a9xico": "Amazon Mexico",
+        "ENV\ufffdO": "ENVIO",
+        "D\ufffdA": "DIA",
     }
 
     for wrong, right in replacements.items():
@@ -80,6 +77,27 @@ def extract_price(text: str) -> str:
     return found.group(0).replace(" ", "").strip()
 
 
+async def is_blocked_page(page: Any) -> bool:
+    title = normalize_text(await page.title())
+    if "robot" in title.lower() or "captcha" in title.lower():
+        return True
+
+    selectors = [
+        "form[action*='validateCaptcha']",
+        "input[name='field-keywords']",
+        "#captchacharacters",
+        "img[src*='captcha']",
+    ]
+
+    for selector in selectors:
+        if await page.query_selector(selector):
+            return True
+
+    content = normalize_text(await page.content())
+    lowered = content.lower()
+    return "enter the characters" in lowered or "escribe los caracteres" in lowered
+
+
 async def scrape_amazon_data(page: Any, asin: str) -> Dict[str, str]:
     data = {
         "Precio Tachado": "N/A",
@@ -95,11 +113,24 @@ async def scrape_amazon_data(page: Any, asin: str) -> Dict[str, str]:
     await page.goto(url_dp, wait_until="domcontentloaded", timeout=60000)
     await asyncio.sleep(random.uniform(1.2, 2.5))
 
+    if await is_blocked_page(page):
+        raise RuntimeError("Bloqueado por Amazon (captcha/robot check).")
+
     strike_el = await page.query_selector(
         "span.a-price.a-text-price span.a-offscreen, #basisPrice span.a-offscreen"
     )
     if strike_el:
         data["Precio Tachado"] = normalize_text(await strike_el.inner_text())
+
+    # Fallback base price directly from product page
+    base_price_el = await page.query_selector(
+        "#price_inside_buybox, #priceblock_dealprice, #priceblock_ourprice, .a-price .a-offscreen"
+    )
+    if base_price_el:
+        base_price = extract_price(normalize_text(await base_price_el.inner_text()))
+        if base_price != "N/A":
+            data["Mejor Precio"] = base_price
+            data["Seller"] = "Amazon Mexico"
 
     offer_selectors = [
         "#olpLinkWidget_feature_div a",
@@ -128,6 +159,9 @@ async def scrape_amazon_data(page: Any, asin: str) -> Dict[str, str]:
             timeout=60000,
         )
         await asyncio.sleep(2)
+
+    if await is_blocked_page(page):
+        raise RuntimeError("Bloqueado por Amazon al abrir ofertas (captcha/robot check).")
 
     offers_found: List[Dict[str, str]] = []
     boxes = await page.query_selector_all("#aod-pinned-offer, .aod-offer, .olpOffer, #aod-offer")
@@ -171,13 +205,25 @@ async def scrape_asins(asins: List[str], headless: bool = True) -> Dict[str, Any
     log(f"Inicio scraping. total_asins={total} headless={headless}")
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless)
+        browser = await playwright.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 900},
+            locale="es-MX",
+            timezone_id="America/Mexico_City",
+            extra_http_headers={
+                "Accept-Language": "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
         )
         page = await context.new_page()
 
