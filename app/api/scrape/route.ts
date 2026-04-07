@@ -1,6 +1,3 @@
-import { spawn } from "node:child_process";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import path from "node:path";
 import { NextResponse } from "next/server";
 import { splitValidAndInvalid } from "@/lib/asins";
 import type { ScrapeItem, ScrapeResponse } from "@/types/scrape";
@@ -11,22 +8,7 @@ export const dynamic = "force-dynamic";
 const MAX_ASINS = 100;
 const SCRAPER_TIMEOUT_MS = 2 * 60 * 1000;
 const SCRAPER_API_URL = process.env.SCRAPER_API_URL?.trim();
-
-type Command = {
-  executable: string;
-  args: string[];
-};
-
-function forceKillChild(child: ChildProcessWithoutNullStreams) {
-  child.kill("SIGTERM");
-
-  if (process.platform === "win32" && child.pid) {
-    spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-  }
-}
+const IS_VERCEL = Boolean(process.env.VERCEL);
 
 function sanitizeText(value: string): string {
   let text = value;
@@ -81,15 +63,17 @@ function sanitizeResponse(response: ScrapeResponse): ScrapeResponse {
 
 async function runRemoteScraper(asins: string[], requestId: string): Promise<ScrapeResponse> {
   if (!SCRAPER_API_URL) {
-    throw new Error("SCRAPER_API_URL no configurado.");
+    throw new Error(
+      "SCRAPER_API_URL no configurado. Define esta variable en Vercel con la URL de Render.",
+    );
   }
 
+  const endpoint = `${SCRAPER_API_URL.replace(/\/$/, "")}/scrape`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SCRAPER_TIMEOUT_MS);
 
   try {
-    const endpoint = `${SCRAPER_API_URL.replace(/\/$/, "")}/scrape`;
-    console.log(`[scrape:${requestId}] Remote call -> ${endpoint}`);
+    console.log(`[scrape:${requestId}] remote endpoint=${endpoint}`);
 
     const response = await fetch(endpoint, {
       method: "POST",
@@ -98,126 +82,31 @@ async function runRemoteScraper(asins: string[], requestId: string): Promise<Scr
       signal: controller.signal,
     });
 
-    const json = (await response.json()) as ScrapeResponse | { error: string };
-    if (!response.ok || "error" in json) {
-      const message = "error" in json ? json.error : "Error remoto inesperado.";
-      throw new Error(message);
+    const raw = await response.text();
+    let payload: unknown;
+
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      payload = { error: raw || `Remote status ${response.status}` };
     }
 
-    return sanitizeResponse(json);
+    if (!response.ok) {
+      const errorObject = payload as { error?: string; detail?: string };
+      const detail = errorObject.error ?? errorObject.detail ?? `Remote status ${response.status}`;
+      throw new Error(`Render error: ${detail}`);
+    }
+
+    return sanitizeResponse(payload as ScrapeResponse);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("Timeout llamando al scraper remoto (2 minutos).");
+    }
+
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
-}
-
-function runLocalScraperCommand(command: Command, input: string, requestId: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    console.log(`[scrape:${requestId}] Local exec ${command.executable} ${command.args.join(" ")}`);
-
-    const child = spawn(command.executable, command.args, {
-      cwd: process.cwd(),
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      env: {
-        ...process.env,
-        PYTHONUTF8: "1",
-      },
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        forceKillChild(child);
-        reject(new Error("Timeout ejecutando scraper local (2 minutos)."));
-      }
-    }, SCRAPER_TIMEOUT_MS);
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      stderr += text;
-      for (const line of text.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (trimmed) {
-          console.log(`[scrape:${requestId}] ${trimmed}`);
-        }
-      }
-    });
-
-    child.on("error", (error) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        reject(error);
-      }
-    });
-
-    child.on("close", (code) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      clearTimeout(timeout);
-
-      if (code !== 0) {
-        reject(new Error(stderr || `Python termino con codigo ${code}.`));
-        return;
-      }
-
-      if (!stdout.trim()) {
-        reject(new Error("El scraper local no devolvio salida JSON."));
-        return;
-      }
-
-      resolve(stdout.trim());
-    });
-
-    child.stdin.write(input);
-    child.stdin.end();
-  });
-}
-
-async function runLocalScraper(asins: string[], requestId: string): Promise<ScrapeResponse> {
-  const scriptPath = path.join(process.cwd(), "amazon_scraper.py");
-  const commands: Command[] = [
-    { executable: "python", args: ["-X", "utf8", scriptPath, "--stdin-json", "--headless"] },
-    { executable: "py", args: ["-3", "-X", "utf8", scriptPath, "--stdin-json", "--headless"] },
-  ];
-
-  const payload = JSON.stringify({ asins });
-  let lastError: unknown;
-
-  for (const command of commands) {
-    try {
-      const output = await runLocalScraperCommand(command, payload, requestId);
-      const parsed = JSON.parse(output) as ScrapeResponse;
-      return sanitizeResponse(parsed);
-    } catch (error) {
-      lastError = error;
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[scrape:${requestId}] Local fallback failed (${command.executable}): ${message}`);
-    }
-  }
-
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("No se pudo ejecutar scraper local con python ni py -3.");
-}
-
-async function runScraper(asins: string[], requestId: string): Promise<ScrapeResponse> {
-  if (SCRAPER_API_URL) {
-    return runRemoteScraper(asins, requestId);
-  }
-
-  return runLocalScraper(asins, requestId);
 }
 
 export async function POST(request: Request) {
@@ -229,7 +118,7 @@ export async function POST(request: Request) {
     const { valid, invalid } = splitValidAndInvalid(incoming);
 
     console.log(
-      `[scrape:${requestId}] Request incoming=${incoming.length} valid=${valid.length} invalid=${invalid.length}`,
+      `[scrape:${requestId}] incoming=${incoming.length} valid=${valid.length} invalid=${invalid.length}`,
     );
 
     if (incoming.length === 0) {
@@ -247,12 +136,23 @@ export async function POST(request: Request) {
       );
     }
 
-    const result = await runScraper(valid, requestId);
-    console.log(`[scrape:${requestId}] Done total=${result.meta.total} ok=${result.meta.success}`);
+    if (IS_VERCEL && !SCRAPER_API_URL) {
+      return NextResponse.json(
+        {
+          error:
+            "Configuracion faltante en Vercel: SCRAPER_API_URL. Debe apuntar a tu servicio de Render.",
+        },
+        { status: 500 },
+      );
+    }
+
+    const result = await runRemoteScraper(valid, requestId);
+    console.log(`[scrape:${requestId}] done total=${result.meta.total} ok=${result.meta.success}`);
+
     return NextResponse.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Error desconocido ejecutando scraping.";
-    console.error(`[scrape:${requestId}] Error: ${message}`);
+    console.error(`[scrape:${requestId}] error=${message}`);
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
