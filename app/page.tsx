@@ -39,7 +39,9 @@ const theme = createTheme({
 const REQUEST_TIMEOUT_MS = 2 * 60 * 1000;
 
 function downloadExcelFile(filename: string, bytes: Uint8Array) {
-  const blob = new Blob([bytes], {
+  // Normalize to an ArrayBuffer-backed view for strict BlobPart typing.
+  const normalizedBytes = new Uint8Array(bytes);
+  const blob = new Blob([normalizedBytes], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   });
 
